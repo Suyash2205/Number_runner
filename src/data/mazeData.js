@@ -21,14 +21,15 @@
  * @property {boolean} isCorrectEdge
  */
 
-import { getRandomMaze } from "./mazes.js";
 import { generateQuestions, getGrade } from "./questionGenerator.js";
 
 const gridSize = 5;
 
 const cellId = (x, y) => `c-${x}-${y}`;
 const startCellId = cellId(0, 2);
-const exitCellId = cellId(4, 2);
+let lastExitCellId = null;
+let lastPathPrefix = null;
+const PATH_PREFIX_LENGTH = 8;
 const orthogonalDirections = [
   { dx: 1, dy: 0 },
   { dx: 0, dy: 1 },
@@ -57,7 +58,33 @@ const buildAnswerOptions = (correctAnswerNumber, count, seed) => {
   return Array.from(options).slice(0, count);
 };
 
+const buildUniqueOptions = ({ count, exclude, base, seed }) => {
+  const offsets = [3, -2, 6, -4, 9, -7, 12, -9, 15, -11, 18, -14];
+  const options = new Set();
+  let offsetIndex = 0;
+
+  while (options.size < count && offsetIndex < offsets.length) {
+    const offset = offsets[(offsetIndex + seed) % offsets.length];
+    const candidate = base + offset;
+    if (!exclude.has(candidate)) {
+      options.add(candidate);
+    }
+    offsetIndex += 1;
+  }
+
+  while (options.size < count) {
+    const magnitude = randomInt(1, 25);
+    const candidate = base + (randomFloat() < 0.5 ? -magnitude : magnitude);
+    if (!exclude.has(candidate)) {
+      options.add(candidate);
+    }
+  }
+
+  return Array.from(options);
+};
+
 const randomFloat = () => Math.random();
+const randomInt = (min, max) => Math.floor(randomFloat() * (max - min + 1)) + min;
 
 const shuffle = (items) => {
   const result = [...items];
@@ -66,6 +93,24 @@ const shuffle = (items) => {
     [result[i], result[j]] = [result[j], result[i]];
   }
   return result;
+};
+
+const pickRandomExitCellId = () => {
+  const candidates = [];
+  for (let y = 0; y < gridSize; y += 1) {
+    for (let x = 0; x < gridSize; x += 1) {
+      const id = cellId(x, y);
+      if (id !== startCellId) {
+        candidates.push(id);
+      }
+    }
+  }
+  if (candidates.length === 0) {
+    return startCellId;
+  }
+  const selected = candidates[Math.floor(randomFloat() * candidates.length)];
+  lastExitCellId = selected;
+  return selected;
 };
 
 const neighborCandidates = (x, y, directions = allDirections) =>
@@ -100,7 +145,7 @@ const directionFamily = (dx, dy) => {
 };
 const directionKey = (dx, dy) => `${dx},${dy}`;
 
-const generateSolutionPath = ({ minLength, maxLength }) => {
+const generateSolutionPath = ({ minLength, maxLength, startCellId, exitCellId }) => {
   const start = startCellId;
   const exit = exitCellId;
   const maxAttempts = 200;
@@ -111,7 +156,15 @@ const generateSolutionPath = ({ minLength, maxLength }) => {
 
     const dfs = (currentId, lastDirKey, runLength) => {
       if (currentId === exit) {
-        return path.length >= minLength && path.length <= maxLength;
+        const lengthOk = path.length >= minLength && path.length <= maxLength;
+        if (!lengthOk) {
+          return false;
+        }
+        const prefix = path.slice(0, PATH_PREFIX_LENGTH).join("|");
+        if (lastPathPrefix && prefix === lastPathPrefix) {
+          return false;
+        }
+        return true;
       }
       if (path.length >= maxLength) {
         return false;
@@ -137,7 +190,8 @@ const generateSolutionPath = ({ minLength, maxLength }) => {
           if (lastDirKey && entry.key === lastDirKey) {
             penalty += 1;
           }
-          return penalty;
+          // Random jitter to avoid deterministic ordering on ties.
+          return penalty + randomFloat();
         };
         return penaltyFor(a) - penaltyFor(b);
       });
@@ -172,6 +226,7 @@ const generateSolutionPath = ({ minLength, maxLength }) => {
   for (let attemptIndex = 0; attemptIndex < maxAttempts; attemptIndex += 1) {
     const result = attempt();
     if (result) {
+      lastPathPrefix = result.slice(0, PATH_PREFIX_LENGTH).join("|");
       return result;
     }
   }
@@ -191,29 +246,16 @@ const generateSolutionPath = ({ minLength, maxLength }) => {
   ];
 };
 
-const generateMazeOnce = () => {
-  const solutionPath = generateSolutionPath({ minLength: 10, maxLength: 14 });
-  const solutionSet = new Set(solutionPath);
-  const solutionNextMap = new Map(
-    solutionPath.slice(0, -1).map((cellIdAt, index) => [cellIdAt, solutionPath[index + 1]])
-  );
-  const solutionPrevMap = new Map(
-    solutionPath.slice(1).map((cellIdAt, index) => [cellIdAt, solutionPath[index]])
-  );
-
-  /** @type {Cell[]} */
-  const cells = Array.from({ length: gridSize * gridSize }, (_, index) => {
+const buildBaseCells = (exitCellId) =>
+  Array.from({ length: gridSize * gridSize }, (_, index) => {
     const x = index % gridSize;
     const y = Math.floor(index / gridSize);
-    const [left, right] = questionSeeds[index];
-    const correctAnswerNumber = left + right;
-
     return {
       id: cellId(x, y),
       x,
       y,
-      question: `${left} + ${right}`,
-      correctAnswerNumber,
+      question: "",
+      correctAnswerNumber: 0,
       answerOptions: [],
       solved: false,
       visited: false,
@@ -222,18 +264,25 @@ const generateMazeOnce = () => {
     };
   });
 
+const generateMazeOnce = (exitCellId) => {
+  const minLength = randomInt(8, 11);
+  const maxLength = Math.max(minLength + 2, randomInt(12, 16));
+  const solutionPath = generateSolutionPath({
+    minLength,
+    maxLength,
+    startCellId,
+    exitCellId,
+  });
+  const solutionSet = new Set(solutionPath);
+  const solutionNextMap = new Map(
+    solutionPath.slice(0, -1).map((cellIdAt, index) => [cellIdAt, solutionPath[index + 1]])
+  );
+
+  /** @type {Cell[]} */
+  const cells = buildBaseCells(exitCellId);
+  const cellMap = new Map(cells.map((cell) => [cell.id, cell]));
   /** @type {Path[]} */
   const paths = [];
-  const outgoingMap = new Map();
-  const cellMap = new Map(cells.map((cell) => [cell.id, cell]));
-  const usedCells = new Set(solutionPath);
-
-  const markDeadEnd = (cellIdToMark) => {
-    const cell = cellMap.get(cellIdToMark);
-    if (cell) {
-      cell.isDeadEnd = true;
-    }
-  };
 
   const addEdge = ({ fromId, toId, isCorrectEdge }) => {
     const fromCell = cellMap.get(fromId);
@@ -250,185 +299,19 @@ const generateMazeOnce = () => {
       isDiagonal,
       isCorrectEdge,
     });
-    outgoingMap.set(fromId, [...(outgoingMap.get(fromId) || []), toId]);
   };
 
-  const getOutgoingCount = (cellIdToCount) =>
-    (outgoingMap.get(cellIdToCount) || []).length;
-
-  const availableNeighbors = (cellIdToCheck, excludeIds = new Set()) => {
-    const { x, y } = cellCoords(cellIdToCheck);
-    return shuffle(
-      neighborCandidates(x, y, allDirections).map((candidate) => cellId(candidate.x, candidate.y))
-    ).filter(
-      (candidateId) =>
-        !excludeIds.has(candidateId) && candidateId !== exitCellId
-    );
-  };
-
-  const addSideDeadEnd = (fromId, excludeIds) => {
-    const candidates = availableNeighbors(fromId, excludeIds);
-    if (candidates.length === 0) {
-      return null;
-    }
-    const terminalId = candidates[0];
-    usedCells.add(terminalId);
-    markDeadEnd(terminalId);
-    addEdge({ fromId, toId: terminalId, isCorrectEdge: false });
-    return terminalId;
-  };
-
-  const buildWrongCorridor = (fromId, startId, minLen = 2, maxLen = 3) => {
-    if (usedCells.has(startId) || solutionSet.has(startId)) {
-      return null;
-    }
-
-    addEdge({ fromId, toId: startId, isCorrectEdge: false });
-    const corridorNodes = [startId];
-    const corridorSteps = minLen + Math.floor(randomFloat() * (maxLen - minLen + 1)) - 1;
-
-    for (let step = 0; step < corridorSteps; step += 1) {
-      const currentId = corridorNodes[corridorNodes.length - 1];
-      const exclude = new Set([
-        fromId,
-        exitCellId,
-        ...solutionPath,
-        ...usedCells,
-        ...corridorNodes,
-      ]);
-      const nextCandidates = availableNeighbors(currentId, exclude);
-      if (nextCandidates.length === 0) {
-        return null;
-      }
-      const nextId = nextCandidates[0];
-      corridorNodes.push(nextId);
-    }
-
-    if (corridorNodes.length < minLen) {
-      return null;
-    }
-
-    corridorNodes.forEach((nodeId) => usedCells.add(nodeId));
-    const terminalId = corridorNodes[corridorNodes.length - 1];
-    markDeadEnd(terminalId);
-
-    for (let i = 0; i < corridorNodes.length - 1; i += 1) {
+  cells.forEach((cell) => {
+    const neighbors = neighborCandidates(cell.x, cell.y, allDirections);
+    neighbors.forEach((candidate) => {
+      const toId = cellId(candidate.x, candidate.y);
       addEdge({
-        fromId: corridorNodes[i],
-        toId: corridorNodes[i + 1],
-        isCorrectEdge: false,
+        fromId: cell.id,
+        toId,
+        isCorrectEdge: solutionNextMap.get(cell.id) === toId,
       });
-    }
-
-    for (let i = 0; i < corridorNodes.length - 1; i += 1) {
-      const nodeId = corridorNodes[i];
-      const neighborCount = neighborCandidates(
-        cellCoords(nodeId).x,
-        cellCoords(nodeId).y,
-        allDirections
-      ).length;
-      const desiredOptions = neighborCount >= 3 ? 3 : 2;
-      while (getOutgoingCount(nodeId) < desiredOptions) {
-        const exclude = new Set([
-          fromId,
-          exitCellId,
-          ...solutionPath,
-          ...usedCells,
-          ...corridorNodes,
-        ]);
-        if (!addSideDeadEnd(nodeId, exclude)) {
-          return null;
-        }
-      }
-    }
-
-    return startId;
-  };
-
-  let generationFailed = false;
-  solutionPath.slice(0, -1).forEach((fromId) => {
-    const nextOnSolution = solutionNextMap.get(fromId);
-    const prevOnSolution = solutionPrevMap.get(fromId);
-    const { x, y } = cellCoords(fromId);
-    const candidates = neighborCandidates(x, y, allDirections);
-    const neighborCount = candidates.length;
-    const minOptions = neighborCount >= 3 ? 3 : 2;
-    const wrongNeeded = Math.max(0, minOptions - 1);
-    const wrongTargets = [];
-
-    const shuffledCandidates = shuffle(
-      candidates.map((candidate) => cellId(candidate.x, candidate.y))
-    );
-    const candidateWrongNeighbors = shuffledCandidates.filter(
-      (candidateId) =>
-        !solutionSet.has(candidateId) &&
-        candidateId !== nextOnSolution &&
-        candidateId !== prevOnSolution &&
-        candidateId !== exitCellId
-    );
-
-    candidateWrongNeighbors.forEach((candidateId) => {
-      if (wrongTargets.length >= wrongNeeded) {
-        return;
-      }
-      if (candidateId === nextOnSolution) {
-        return;
-      }
-      const corridorStartId = buildWrongCorridor(fromId, candidateId, 2, 3);
-      if (corridorStartId) {
-        wrongTargets.push(corridorStartId);
-      }
     });
-
-    if (wrongTargets.length < wrongNeeded) {
-      generationFailed = true;
-      return;
-    }
-
-    addEdge({ fromId, toId: nextOnSolution, isCorrectEdge: true });
-    wrongTargets.forEach((toId) => addEdge({ fromId, toId, isCorrectEdge: false }));
   });
-
-  const assignAnswerNumbers = () => {
-    const edgeGroups = new Map();
-    paths.forEach((edge) => {
-      edgeGroups.set(edge.fromCellId, [...(edgeGroups.get(edge.fromCellId) || []), edge]);
-    });
-
-    cells.forEach((cell) => {
-      if (cell.isExit || cell.isDeadEnd) {
-        cell.answerOptions = [];
-        return;
-      }
-      const edges = edgeGroups.get(cell.id) || [];
-      if (edges.length === 0) {
-        cell.answerOptions = [];
-        return;
-      }
-      const options = buildAnswerOptions(
-        cell.correctAnswerNumber,
-        edges.length,
-        cell.x + cell.y * gridSize
-      );
-      cell.answerOptions = options;
-
-      if (solutionSet.has(cell.id)) {
-        const wrongOptions = options.filter(
-          (option) => option !== cell.correctAnswerNumber
-        );
-        let wrongIndex = 0;
-        edges.forEach((edge) => {
-          edge.answerNumber = edge.isCorrectEdge
-            ? cell.correctAnswerNumber
-            : wrongOptions[wrongIndex++ % wrongOptions.length];
-        });
-      } else {
-        edges.forEach((edge, index) => {
-          edge.answerNumber = options[index % options.length];
-        });
-      }
-    });
-  };
 
   const validateMaze = () => {
     const outgoingCounts = new Map();
@@ -502,17 +385,16 @@ const generateMazeOnce = () => {
     return true;
   };
 
-  assignAnswerNumbers();
-  if (generationFailed || !validateMaze()) {
+  if (!validateMaze()) {
     return null;
   }
 
   return { cells, paths, solutionPath };
 };
 
-const generateMazeWithRetries = (attempts = 30) => {
+const generateMazeWithRetries = (exitCellId, attempts = 30) => {
   for (let i = 0; i < attempts; i += 1) {
-    const result = generateMazeOnce();
+    const result = generateMazeOnce(exitCellId);
     if (result) {
       return result;
     }
@@ -520,50 +402,33 @@ const generateMazeWithRetries = (attempts = 30) => {
   return null;
 };
 
-const buildFallbackMaze = () => {
-  const solutionPath = [
-    startCellId,
-    cellId(1, 1),
-    cellId(1, 0),
-    cellId(2, 0),
-    cellId(3, 1),
-    cellId(3, 2),
-    cellId(2, 3),
-    cellId(2, 4),
-    cellId(3, 4),
-    cellId(4, 3),
-    exitCellId,
-  ];
-  const solutionSet = new Set(solutionPath);
-
-  /** @type {Cell[]} */
-  const cells = Array.from({ length: gridSize * gridSize }, (_, index) => {
-    const x = index % gridSize;
-    const y = Math.floor(index / gridSize);
-    const [left, right] = questionSeeds[index];
-    const correctAnswerNumber = left + right;
-
-    return {
-      id: cellId(x, y),
-      x,
-      y,
-      question: `${left} + ${right}`,
-      correctAnswerNumber,
-      answerOptions: [],
-      solved: false,
-      visited: false,
-      isExit: cellId(x, y) === exitCellId,
-      isDeadEnd: false,
-    };
-  });
-
-  const cellMap = new Map(cells.map((cell) => [cell.id, cell]));
+const buildFallbackMaze = (exitCellId) => {
+  const cells = buildBaseCells(exitCellId);
   /** @type {Path[]} */
   const paths = [];
+  const solutionPath = [startCellId];
+  const start = cellCoords(startCellId);
+  const exit = cellCoords(exitCellId);
+  let x = start.x;
+  let y = start.y;
+
+  while (x !== exit.x || y !== exit.y) {
+    const dx = exit.x - x;
+    const dy = exit.y - y;
+    if (dx !== 0 && dy !== 0) {
+      x += Math.sign(dx);
+      y += Math.sign(dy);
+    } else if (dx !== 0) {
+      x += Math.sign(dx);
+    } else {
+      y += Math.sign(dy);
+    }
+    solutionPath.push(cellId(x, y));
+  }
 
   const addEdge = ({ fromId, toId, isCorrectEdge }) => {
-    const fromCell = cellMap.get(fromId);
-    const toCell = cellMap.get(toId);
+    const fromCell = cellCoords(fromId);
+    const toCell = cellCoords(toId);
     const isDiagonal =
       Math.abs(toCell.x - fromCell.x) === 1 && Math.abs(toCell.y - fromCell.y) === 1;
     paths.push({
@@ -576,115 +441,42 @@ const buildFallbackMaze = () => {
   };
 
   solutionPath.slice(0, -1).forEach((fromId, index) => {
-    const nextId = solutionPath[index + 1];
-    const fromCell = cellMap.get(fromId);
-    const { x, y } = cellCoords(fromId);
-    const candidates = shuffle(
-      neighborCandidates(x, y, allDirections)
-        .map((candidate) => cellId(candidate.x, candidate.y))
-        .filter((candidateId) => candidateId !== nextId)
-    );
-    const wrongTargets = [];
-    candidates.forEach((candidateId) => {
-      if (wrongTargets.length >= 2) {
-        return;
-      }
-      if (!solutionSet.has(candidateId)) {
-        wrongTargets.push(candidateId);
-      }
-    });
-    if (wrongTargets.length < 2) {
-      candidates.forEach((candidateId) => {
-        if (wrongTargets.length >= 2) {
-          return;
-        }
-        if (!wrongTargets.includes(candidateId)) {
-          wrongTargets.push(candidateId);
-        }
-      });
-    }
-
-    addEdge({ fromId, toId: nextId, isCorrectEdge: true });
-    wrongTargets.forEach((wrongId) => {
-      addEdge({ fromId, toId: wrongId, isCorrectEdge: false });
-      const wrongCell = cellMap.get(wrongId);
-      if (wrongCell) {
-        wrongCell.isDeadEnd = true;
-        wrongCell.answerOptions = [];
-      }
-    });
-
-    const outgoing = paths.filter((edge) => edge.fromCellId === fromId);
-    const options = buildAnswerOptions(
-      fromCell.correctAnswerNumber,
-      outgoing.length,
-      x + y * gridSize
-    );
-    fromCell.answerOptions = options;
-    const wrongOptions = options.filter((option) => option !== fromCell.correctAnswerNumber);
-    let wrongIndex = 0;
-    outgoing.forEach((edge) => {
-      edge.answerNumber = edge.isCorrectEdge
-        ? fromCell.correctAnswerNumber
-        : wrongOptions[wrongIndex++ % wrongOptions.length];
-    });
+    addEdge({ fromId, toId: solutionPath[index + 1], isCorrectEdge: true });
   });
 
+  lastPathPrefix = solutionPath.slice(0, PATH_PREFIX_LENGTH).join("|");
   return { cells, paths, solutionPath };
 };
 
-// Get random maze preset
-const selectedMaze = getRandomMaze();
+const applyQuestionsToCells = (cells, grade) => {
+  const generatedQuestions = generateQuestions(gridSize * gridSize, grade);
+  cells.forEach((cell, index) => {
+    const questionData = generatedQuestions[index];
+    cell.question = questionData.question;
+    cell.correctAnswerNumber = questionData.answer;
+  });
+};
 
-// Generate questions at runtime for each cell (grade from storage, default 5)
-const grade = getGrade();
-const generatedQuestions = generateQuestions(gridSize * gridSize, grade);
+const markDeadEnds = (cells, paths) => {
+  const outgoingMap = new Map();
+  paths.forEach((path) => {
+    outgoingMap.set(
+      path.fromCellId,
+      [...(outgoingMap.get(path.fromCellId) || []), path.toCellId]
+    );
+  });
+  cells.forEach((cell) => {
+    if (cell.isExit) {
+      cell.isDeadEnd = false;
+      return;
+    }
+    const outgoingCount = (outgoingMap.get(cell.id) || []).length;
+    cell.isDeadEnd = outgoingCount === 0;
+  });
+};
 
-// Create cells with generated questions
-const cells = Array.from({ length: gridSize * gridSize }, (_, index) => {
-  const x = index % gridSize;
-  const y = Math.floor(index / gridSize);
-  const questionData = generatedQuestions[index];
-  const cellIdStr = cellId(x, y);
-
-  return {
-    id: cellIdStr,
-    x,
-    y,
-    question: questionData.question,
-    correctAnswerNumber: questionData.answer,
-    answerOptions: [],
-    solved: false,
-    visited: false,
-    isExit: cellIdStr === exitCellId,
-    isDeadEnd: false, // Will be set below
-  };
-});
-
-// Use paths from selected maze, but we need to assign answer numbers
-const paths = selectedMaze.paths.map(p => ({ ...p }));
-const solutionPath = [...selectedMaze.solutionPath];
-const solutionSet = new Set(solutionPath);
-
-// Mark dead ends - cells that are not on solution path and have no outgoing paths
-const cellMap = new Map(cells.map((cell) => [cell.id, cell]));
-const outgoingMap = new Map();
-paths.forEach((path) => {
-  outgoingMap.set(path.fromCellId, [...(outgoingMap.get(path.fromCellId) || []), path.toCellId]);
-});
-
-cells.forEach((cell) => {
-  if (cell.isExit) {
-    return;
-  }
-  // A cell is a dead end if it's not on the solution path and has no outgoing paths
-  if (!solutionSet.has(cell.id) && (!outgoingMap.has(cell.id) || outgoingMap.get(cell.id).length === 0)) {
-    cell.isDeadEnd = true;
-  }
-});
-
-// Assign answer numbers to paths (using existing logic)
-const assignAnswerNumbers = () => {
+const assignAnswerNumbers = (cells, paths, solutionPath) => {
+  const solutionSet = new Set(solutionPath);
   const edgeGroups = new Map();
   paths.forEach((edge) => {
     edgeGroups.set(edge.fromCellId, [...(edgeGroups.get(edge.fromCellId) || []), edge]);
@@ -700,38 +492,78 @@ const assignAnswerNumbers = () => {
       cell.answerOptions = [];
       return;
     }
-    const options = buildAnswerOptions(
-      cell.correctAnswerNumber,
-      edges.length,
-      cell.x + cell.y * gridSize
-    );
-    cell.answerOptions = options;
+    const seed = cell.x + cell.y * gridSize;
+    const assignUniqueEdgeNumbers = ({ includeCorrect }) => {
+      const used = new Set();
+      const edgeValues = new Map();
+      const correctEdge = edges.find((edge) => edge.isCorrectEdge);
+      if (includeCorrect && correctEdge) {
+        used.add(cell.correctAnswerNumber);
+        edgeValues.set(correctEdge, cell.correctAnswerNumber);
+      }
+
+      const remainingEdges = edges.filter((edge) => edge !== correctEdge);
+      const desiredCount = remainingEdges.length;
+      let attempt = 0;
+      let values = [];
+      while (attempt < 10) {
+        values = buildUniqueOptions({
+          count: desiredCount,
+          exclude: used,
+          base: cell.correctAnswerNumber,
+          seed: seed + attempt * 11,
+        });
+        if (new Set(values).size === desiredCount) {
+          break;
+        }
+        attempt += 1;
+      }
+      const finalValues = [...values];
+      let cursor = 1;
+      while (finalValues.length < desiredCount) {
+        const candidate = cell.correctAnswerNumber + cursor;
+        if (!used.has(candidate) && !finalValues.includes(candidate)) {
+          finalValues.push(candidate);
+        }
+        cursor += 1;
+      }
+
+      remainingEdges.forEach((edge, index) => {
+        edgeValues.set(edge, finalValues[index]);
+      });
+
+      edges.forEach((edge) => {
+        edge.answerNumber = edgeValues.get(edge);
+      });
+
+      cell.answerOptions = edges.map((edge) => edge.answerNumber);
+    };
 
     if (solutionSet.has(cell.id)) {
-      const wrongOptions = options.filter(
-        (option) => option !== cell.correctAnswerNumber
-      );
-      let wrongIndex = 0;
-      edges.forEach((edge) => {
-        edge.answerNumber = edge.isCorrectEdge
-          ? cell.correctAnswerNumber
-          : wrongOptions[wrongIndex++ % wrongOptions.length];
-      });
+      assignUniqueEdgeNumbers({ includeCorrect: true });
     } else {
-      edges.forEach((edge, index) => {
-        edge.answerNumber = options[index % options.length];
-      });
+      assignUniqueEdgeNumbers({ includeCorrect: false });
+    }
+    const answerSet = new Set(cell.answerOptions);
+    if (answerSet.size !== cell.answerOptions.length) {
+      console.warn("Duplicate answers detected for cell", cell.id, cell.answerOptions);
     }
   });
 };
 
-assignAnswerNumbers();
+export const createMaze = ({ grade = getGrade() } = {}) => {
+  const exitCellId = pickRandomExitCellId();
+  const maze = generateMazeWithRetries(exitCellId) || buildFallbackMaze(exitCellId);
+  applyQuestionsToCells(maze.cells, grade);
+  markDeadEnds(maze.cells, maze.paths);
+  assignAnswerNumbers(maze.cells, maze.paths, maze.solutionPath);
 
-export const demoMaze = {
-  gridSize,
-  cells,
-  paths,
-  startCellId,
-  exitCellId,
-  solutionPath,
+  return {
+    gridSize,
+    cells: maze.cells,
+    paths: maze.paths,
+    startCellId,
+    exitCellId,
+    solutionPath: maze.solutionPath,
+  };
 };

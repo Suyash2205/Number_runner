@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState, useEffect } from "react";
-import { demoMaze } from "../data/mazeData.js";
+import { createMaze } from "../data/mazeData.js";
 
 const percent = (value, max) => `${(value / max) * 100}%`;
 
@@ -104,7 +104,8 @@ export default function MazeViewport({
   finishTimeFormatted = null,
   finishIsNewRecord = false,
 }) {
-  const { gridSize, cells, paths, startCellId, solutionPath, exitCellId } = demoMaze;
+  const maze = useMemo(() => createMaze(), []);
+  const { gridSize, cells, paths, startCellId, solutionPath, exitCellId } = maze;
   const cellMap = new Map(cells.map((cell) => [cell.id, cell]));
   const sortedCells = [...cells].sort((a, b) =>
     a.y === b.y ? a.x - b.x : a.y - b.y
@@ -119,6 +120,8 @@ export default function MazeViewport({
   const [lastMoveType, setLastMoveType] = useState("none");
   const [revealAll, setRevealAll] = useState(false);
   const [hasEscaped, setHasEscaped] = useState(false);
+  const [forcedDeadEnds, setForcedDeadEnds] = useState(() => new Set());
+  const [solutionIndex, setSolutionIndex] = useState(0);
   const moveTimeoutRef = useRef(null);
   const boardRef = useRef(null);
   const [boardSize, setBoardSize] = useState({ width: 0, height: 0 });
@@ -166,6 +169,10 @@ export default function MazeViewport({
   }, [solutionPath]);
 
   const solutionSet = useMemo(() => new Set(solutionPath), [solutionPath]);
+  const solutionIndexById = useMemo(
+    () => new Map(solutionPath.map((id, index) => [id, index])),
+    [solutionPath]
+  );
 
   const { pathRenderData, pathMap, adjacencyMap, outgoingMap } = useMemo(() => {
     const map = new Map();
@@ -226,13 +233,6 @@ export default function MazeViewport({
   const isRevealed = (cellId) => isVisible(cellId);
   const getOutgoingEdges = (cellId) =>
     (outgoingMap.get(cellId) || []).map((key) => pathMap.get(key));
-  const isTerminalDeadEnd = (cellId) => {
-    const cell = cellMap.get(cellId);
-    if (!cell || cell.isExit) {
-      return false;
-    }
-    return Boolean(cell.isDeadEnd) && getOutgoingEdges(cellId).length === 0;
-  };
   const canBacktrackTo = (cellId) =>
     cellId !== currentCellId && isVisited(cellId) && currentNeighbors.has(cellId);
 
@@ -271,7 +271,9 @@ export default function MazeViewport({
     currentOutgoingEdges.length > 0 ? currentOutgoingEdges : fallbackEdges;
   const isGameOver = false;
   const clickableEdgeIds = labelEdges.map((edge) => edge.toCellId);
-  const isDeadEndNow = isTerminalDeadEnd(currentCellId);
+  const isForcedDeadEnd = forcedDeadEnds.has(currentCellId);
+  const isDeadEndNow =
+    isForcedDeadEnd || Boolean(cellMap.get(currentCellId)?.isDeadEnd);
   const showEdges = hasEscaped;
 
   useEffect(() => {
@@ -312,8 +314,10 @@ export default function MazeViewport({
     const fromCell = cellMap.get(edge.fromCellId);
     const toCell = cellMap.get(edge.toCellId);
     const isCorrectMove =
+      currentCellId === solutionPath[solutionIndex] &&
       expectedNext === edge.toCellId &&
-      edge.answerNumber === fromCell.correctAnswerNumber;
+      edge.answerNumber === fromCell.correctAnswerNumber &&
+      edge.isCorrectEdge;
     const moveDirection = toCell
       ? directionFromDelta(toCell.x - fromCell.x, toCell.y - fromCell.y)
       : "UNK";
@@ -330,11 +334,21 @@ export default function MazeViewport({
       isCorrectMove,
       moveDirection
     );
+    if (toCell?.isExit && !isCorrectMove) {
+      setLastMoveType("blocked");
+      return;
+    }
+
     setIsMoving(true);
-    setLastMoveType("forward");
-    markSolved(currentCellId);
+    setLastMoveType(isCorrectMove ? "forward" : "wrong");
+    if (isCorrectMove) {
+      markSolved(currentCellId);
+    }
     markVisited(currentCellId);
     markVisited(edge.toCellId);
+    if (!isCorrectMove && edge.toCellId && !solutionSet.has(edge.toCellId)) {
+      setForcedDeadEnds((prev) => new Set([...prev, edge.toCellId]));
+    }
     setAttemptsByCell((prev) => {
       const next = new Map(prev);
       next.set(currentCellId, (next.get(currentCellId) || 0) + 1);
@@ -346,6 +360,9 @@ export default function MazeViewport({
       return next;
     });
     setCurrentCellId(edge.toCellId);
+    if (isCorrectMove) {
+      setSolutionIndex((prev) => Math.min(prev + 1, solutionPath.length - 1));
+    }
     if (moveTimeoutRef.current) {
       clearTimeout(moveTimeoutRef.current);
     }
@@ -376,6 +393,10 @@ export default function MazeViewport({
     setIsMoving(true);
     setLastMoveType("back");
     setCurrentCellId(cellId);
+    const backIndex = solutionIndexById.get(cellId);
+    if (backIndex != null) {
+      setSolutionIndex(backIndex);
+    }
     if (moveTimeoutRef.current) {
       clearTimeout(moveTimeoutRef.current);
     }
@@ -390,7 +411,7 @@ export default function MazeViewport({
   const spriteLeft = currentCell ? (currentCell.x + 0.5) * cellWidth : 0;
   const spriteTop = currentCell ? (currentCell.y + 0.5) * cellHeight : 0;
   const canShowLabels =
-    !cellMap.get(currentCellId)?.isDeadEnd && labelEdges.length > 0;
+    !isForcedDeadEnd && !cellMap.get(currentCellId)?.isDeadEnd && labelEdges.length > 0;
 
   return (
     <section className="maze-viewport" aria-label="Maze viewport">
